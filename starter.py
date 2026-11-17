@@ -40,15 +40,30 @@ reason (короткая понятная причина). Сохраните и
 """
 
 import asyncio
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, localcontext
+
+
+def _consume_source_exception(task):
+    # После тайм-аута источник ещё может завершиться с ошибкой.
+    if not task.cancelled():
+        task.exception()
 
 
 async def recommend_price(fetch_offers, current_price, min_price, timeout_s=2.0):
+    task = asyncio.create_task(fetch_offers())
+    task.add_done_callback(_consume_source_exception)
     try:
-        result = await asyncio.wait_for(fetch_offers(), timeout=timeout_s)
-    except asyncio.TimeoutError:
+        finished, _ = await asyncio.wait({task}, timeout=timeout_s)
+    finally:
+        if not task.done():
+            task.cancel()
+
+    if not finished:
         return {"price": current_price, "decision": "HOLD", "reason": "Тайм-аут источника"}
-    except Exception:
+
+    try:
+        result = task.result()
+    except (Exception, asyncio.CancelledError):
         return {"price": current_price, "decision": "HOLD", "reason": "Ошибка источника"}
 
     if result["status"] != "success":
@@ -75,11 +90,19 @@ async def recommend_price(fetch_offers, current_price, min_price, timeout_s=2.0)
             "reason": "Нет подходящих предложений",
         }
 
-    discounted = (competitor_price * Decimal("0.985")).quantize(
-        Decimal("0.01"), rounding=ROUND_DOWN
-    )
-    price = max(discounted, min_price)
-    if abs(price - current_price) > current_price * Decimal("0.30"):
+    with localcontext() as context:
+        integer_digits = 1 + max(
+            amount.adjusted() for amount in (competitor_price, current_price, min_price)
+        )
+        # Два знака для копеек и три для множителя 0.985.
+        context.prec = max(context.prec, integer_digits + 5)
+        discounted = (competitor_price * Decimal("0.985")).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+        price = max(discounted, min_price)
+        needs_review = abs(price - current_price) > current_price * Decimal("0.30")
+
+    if needs_review:
         return {"price": price, "decision": "REVIEW", "reason": "Изменение больше 30%"}
 
     return {"price": price, "decision": "APPLY", "reason": "Изменение в пределах 30%"}
